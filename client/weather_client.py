@@ -30,21 +30,21 @@ def fetch_forecast(lat, lon):
 def get_current_temperature(lat, lon):
     """Current air temperature as a float."""
     data = fetch_forecast(lat, lon)
-    temp = data["current_weather"]["temperature"]
+    temp = data["current"]["temperature_2m"]
     return float(temp)
 
 
 def get_current_windspeed(lat, lon):
     """Current wind speed as a float."""
     data = fetch_forecast(lat, lon)
-    wind = data["current_weather"]["windspeed"]
+    wind = data["current"]["windspeed"]
     return float(wind)
 
 
 def get_temperature_unit(lat, lon):
     """Unit string for the temperature value, for example a Celsius sign."""
     data = fetch_forecast(lat, lon)
-    unit = data["current_weather_units"]["temperature"]
+    unit = data["current_units"]["temperature_2m"]
     return unit
 
 
@@ -52,10 +52,10 @@ def get_current_summary(lat, lon):
     """Small summary of current conditions."""
     data = fetch_forecast(lat, lon)
     return {
-        "time": data["current_weather"]["time"],
-        "temperature": float(data["current_weather"]["temperature"]),
-        "windspeed": float(data["current_weather"]["windspeed"]),
-        "unit": data["current_weather_units"]["temperature"],
+        "time": data["current"]["time"],
+        "temperature": float(data["current"]["temperature_2m"]),
+        "windspeed": float(data["current"]["windspeed"]),
+        "unit": data["current_units"]["temperature_2m"],
     }
 
 
