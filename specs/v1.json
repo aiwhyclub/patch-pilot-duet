@@ -1,0 +1,162 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Weather Forecast API (Open-Meteo subset, PatchPilot demo)",
+    "version": "1.0.0",
+    "description": "v1: Open-Meteo current_weather response."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8787"
+    }
+  ],
+  "paths": {
+    "/forecast": {
+      "get": {
+        "operationId": "getForecast",
+        "parameters": [
+          {
+            "name": "latitude",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "longitude",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "current_weather",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Forecast",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForecastResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ForecastResponse": {
+        "type": "object",
+        "required": [
+          "current_weather",
+          "current_weather_units"
+        ],
+        "properties": {
+          "latitude": {
+            "type": "number"
+          },
+          "longitude": {
+            "type": "number"
+          },
+          "generationtime_ms": {
+            "type": "number"
+          },
+          "utc_offset_seconds": {
+            "type": "integer"
+          },
+          "timezone": {
+            "type": "string"
+          },
+          "timezone_abbreviation": {
+            "type": "string"
+          },
+          "elevation": {
+            "type": "number"
+          },
+          "current_weather_units": {
+            "$ref": "#/components/schemas/CurrentWeatherUnits"
+          },
+          "current_weather": {
+            "$ref": "#/components/schemas/CurrentWeather"
+          }
+        }
+      },
+      "CurrentWeatherUnits": {
+        "type": "object",
+        "properties": {
+          "time": {
+            "type": "string"
+          },
+          "interval": {
+            "type": "string"
+          },
+          "temperature": {
+            "type": "string"
+          },
+          "windspeed": {
+            "type": "string"
+          },
+          "winddirection": {
+            "type": "string"
+          },
+          "is_day": {
+            "type": "string"
+          },
+          "weathercode": {
+            "type": "string"
+          }
+        }
+      },
+      "CurrentWeather": {
+        "type": "object",
+        "required": [
+          "time",
+          "interval",
+          "temperature"
+        ],
+        "properties": {
+          "time": {
+            "type": "string",
+            "example": "2026-11-09T01:15"
+          },
+          "interval": {
+            "type": "integer",
+            "example": 900
+          },
+          "temperature": {
+            "type": "number",
+            "example": 8.0
+          },
+          "windspeed": {
+            "type": "number",
+            "example": 2.0
+          },
+          "winddirection": {
+            "type": "number",
+            "example": 315
+          },
+          "is_day": {
+            "type": "integer",
+            "example": 1
+          },
+          "weathercode": {
+            "type": "integer",
+            "example": 1
+          }
+        }
+      }
+    }
+  }
+}

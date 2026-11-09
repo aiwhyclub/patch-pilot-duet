@@ -1,0 +1,19 @@
+[project]
+name = "patchpilot"
+version = "0.1.0"
+description = "Apply API v1->v2 changes to client code; the same locked tests prove the fix."
+requires-python = ">=3.10"
+dependencies = ["anthropic==2.6.0", "requests==2.34.2", "rich==15.0.0"]
+
+[project.optional-dependencies]
+dev = ["pytest==9.2.0"]
+
+[project.scripts]
+patchpilot = "patchpilot.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["patchpilot*"]
