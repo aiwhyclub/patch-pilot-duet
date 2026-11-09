@@ -81,8 +81,8 @@ def build(*, status: str, out_dir: Path | str = "out",
           reproduce: Optional[TestRun] = None, tests_hash_before: Optional[str] = None,
           attempts: Iterable[Attempt] = (), verify: Optional[TestRun] = None,
           tests_hash_after: Optional[str] = None, model: Optional[str] = None,
-          pr_url: Optional[str] = None, error_code: Optional[str] = None,
-          error_message: Optional[str] = None) -> dict:
+          pr_url: Optional[str] = None, pr: Optional[dict] = None,
+          error_code: Optional[str] = None, error_message: Optional[str] = None) -> dict:
     """Report dict per frd-trd.md 8. Extra keys (marked [added] in comments) are additive."""
     if status not in STATUS_EXIT:
         raise ValueError(f"unknown status: {status!r}")
@@ -105,6 +105,7 @@ def build(*, status: str, out_dir: Path | str = "out",
             "patch_file": _rel(out_dir, PATCH_FILE) if patched else None,
             "pr_body_file": _rel(out_dir, PR_BODY_FILE) if patched else None,
             "pr_url": pr_url,
+            "pr": pr,                                                    # [added] --pr only
             "model": model,
             "error": ({"code": error_code, "message": error_message}   # [added]
                       if error_code else None),
@@ -271,6 +272,23 @@ def write(report: dict, patch_text: Optional[str], out_dir: Path | str,
     written.append(_write_text(out / REPORT_FILE,
                                json.dumps(report, indent=2, ensure_ascii=False) + "\n"))
     return written
+
+
+def set_pr(report: dict, pr: dict, out_dir: Path | str,
+           exit_code: Optional[int] = None,
+           error_code: Optional[str] = None, error_message: Optional[str] = None) -> Path:
+    """Record the --pr outcome and rewrite report.json only (patch and PR_BODY.md
+    stay as written). status stays "patched": it describes the patch. exit_code
+    can differ from STATUS_EXIT when the PR step itself failed (S19 -> 2)."""
+    res = report["result"]
+    res["pr"] = pr
+    res["pr_url"] = pr.get("url")
+    if exit_code is not None:
+        res["exit_code"] = exit_code
+    if error_code:
+        res["error"] = {"code": error_code, "message": error_message}
+    return _write_text(Path(out_dir) / REPORT_FILE,
+                       json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
 
 def next_run_number(out_dir: Path | str) -> int:

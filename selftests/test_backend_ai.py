@@ -1,5 +1,8 @@
 """Stdlib self-tests for llm/prompt, llm/client, guard, report, cli.
 
+--pr tests use real git on temp repos, a stub `gh` and a local bare repo as
+the push target: no network, nothing reaches GitHub.
+
 Run from the repository root (no pytest, no anthropic needed):
     PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s selftests -v
 
@@ -291,6 +294,11 @@ class ClientTests(unittest.TestCase):
             (lambda m: m.BadRequestError("bad request", err_type="invalid_request_error"), "S08", 2),
             (lambda m: m.RateLimitError("slow down", err_type="rate_limit_error"), "S12", 3),
             (lambda m: m.InternalServerError("overloaded", err_type="overloaded_error"), "S12", 3),
+            (lambda m: m.APIStatusError("overloaded", status_code=529, err_type="overloaded_error"), "S12", 3),
+            (lambda m: m.APIStatusError("timeout", status_code=408), "S12", 3),
+            (lambda m: m.APIStatusError("conflict", status_code=409), "S12", 3),
+            (lambda m: m.APIStatusError("forbidden", status_code=403, err_type="permission_error"), "S08", 2),
+            (lambda m: m.APIStatusError("billing", status_code=402, err_type="billing_error"), "S08", 2),
             (lambda m: m.APIConnectionError("conn"), "S12", 3),
             (lambda m: m.APITimeoutError("timeout"), "S12", 3),
         ]
@@ -303,8 +311,81 @@ class ClientTests(unittest.TestCase):
             self.run_with(fake_sdk(raise_exc=lambda m: m.NotFoundError("model x\nline2", err_type="not_found_error")))
         self.assertEqual(cm.exception.message, "Claude request rejected (not_found_error): model x")
 
+    def test_timeout_override(self):
+        self.assertEqual(llm_client.timeout_s({}), 90.0)
+        self.assertEqual(llm_client.timeout_s({"PATCHPILOT_TIMEOUT_S": "240"}), 240.0)
+        self.assertEqual(llm_client.timeout_s({"PATCHPILOT_TIMEOUT_S": "5"}), 30.0)
+        self.assertEqual(llm_client.timeout_s({"PATCHPILOT_TIMEOUT_S": "abc"}), 90.0)
+
     def test_effort_schedule(self):
         self.assertEqual([llm_client.effort_for_attempt(n) for n in (1, 2, 3)], ["medium", "medium", "high"])
+
+
+class ResponseShapeTests(unittest.TestCase):
+    """Real Messages API responses: several blocks, thinking blocks with empty
+    text (default display "omitted"), empty content, refusal with stop_details."""
+
+    def call(self, response):
+        sdk = fake_sdk(response)
+        with mock.patch.dict(sys.modules, {"anthropic": sdk}), \
+                mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "d"}, clear=True):
+            return llm_client.request_patch("S", "U", "medium")
+
+    def shape(self, blocks, stop="end_turn", stop_details=None):
+        return types.SimpleNamespace(content=blocks, stop_reason=stop, model="claude-opus-5-5",
+                                     stop_details=stop_details,
+                                     usage=types.SimpleNamespace(input_tokens=1, output_tokens=2))
+
+    def test_text_split_across_blocks_with_thinking(self):
+        half = len(GOOD_DIFF) // 2
+        blocks = [types.SimpleNamespace(type="thinking", thinking="", signature="sig"),
+                  types.SimpleNamespace(type="text", text=GOOD_DIFF[:half]),
+                  types.SimpleNamespace(type="thinking", thinking=""),
+                  types.SimpleNamespace(type="text", text=GOOD_DIFF[half:]),
+                  types.SimpleNamespace(type="redacted_thinking", data="x")]
+        raw, stop = self.call(self.shape(blocks))
+        self.assertEqual((raw, stop), (GOOD_DIFF, "end_turn"))
+
+    def test_empty_and_none_text(self):
+        for blocks in ([], None, [types.SimpleNamespace(type="thinking", thinking="")],
+                       [types.SimpleNamespace(type="text", text=None)]):
+            with self.subTest(blocks=blocks):
+                raw, _ = self.call(self.shape(blocks))
+                self.assertEqual(raw, "")
+        repo = make_repo()
+        try:
+            code, _, _ = guard.check("", "end_turn", guard.allowed_files(repo), repo)
+            self.assertEqual(code, "E_NO_DIFF")
+            code, _, _ = guard.check(None, "end_turn", guard.allowed_files(repo), repo)
+            self.assertEqual(code, "E_NO_DIFF")
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+    def test_refusal_category(self):
+        details = types.SimpleNamespace(type="refusal", category="cyber", explanation="x")
+        raw, stop = self.call(self.shape([], stop="refusal", stop_details=details))
+        self.assertEqual(stop, "refusal")
+        self.assertEqual(llm_client.last_call["stop_category"], "cyber")
+        self.call(self.shape([], stop="refusal", stop_details=types.SimpleNamespace(category=None)))
+        self.assertIsNone(llm_client.last_call["stop_category"])
+        self.call(self.shape([types.SimpleNamespace(type="text", text="x")], stop_details=None))
+        self.assertIsNone(llm_client.last_call["stop_category"])
+
+    def test_truncated(self):
+        _, stop = self.call(self.shape([types.SimpleNamespace(type="text", text="diff --git a/x")],
+                                       stop="max_tokens"))
+        self.assertEqual(stop, "max_tokens")
+
+    def test_attempt_file_with_empty_output(self):
+        out = Path(tempfile.mkdtemp())
+        try:
+            p = report.write_attempt(Attempt(1, "medium", "rejected", "E_REFUSAL", "cyber",
+                                             raw_output="", stop_reason="refusal"), out)
+            text = p.read_text()
+            self.assertIn("code: E_REFUSAL", text)
+            self.assertIn("----- raw output -----\n", text)
+        finally:
+            shutil.rmtree(out)
 
 
 class GuardTests(unittest.TestCase):
@@ -439,7 +520,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report.next_run_number(self.out), 2)
 
 
-class CliTests(unittest.TestCase):
+class CliHarness(unittest.TestCase):
     """End-to-end loop with stubbed diff/usages/proxy/pytest and a fake SDK."""
 
     def setUp(self):
@@ -471,6 +552,7 @@ class CliTests(unittest.TestCase):
         self.patches = [
             mock.patch.object(runner, "check_proxy", lambda url, timeout=3.0: "v2"),
             mock.patch.object(runner, "run_pytest", fake_pytest),
+            mock.patch.object(runner, "preflight_pytest", lambda repo, timeout=30, python=None: 4),
             mock.patch.object(runner, "tests_hash", lambda root: "sha256:" + "a1b2c3d4e5f6" * 5),
         ]
         for p in self.patches:
@@ -505,6 +587,10 @@ class CliTests(unittest.TestCase):
         out = self.repo / "out"
         rep = json.loads((out / "report.json").read_text())
         return code, buf.getvalue(), rep, calls, out
+
+
+
+class CliTests(CliHarness):
 
     def test_reject_then_success(self):
         code, screen, rep, calls, out = self.run_cli([resp(TEST_DIFF), resp(GOOD_DIFF)])
@@ -566,11 +652,315 @@ class CliTests(unittest.TestCase):
             if p.is_file():
                 self.assertNotIn(secret, p.read_text(encoding="utf-8"), p)
 
+    def test_preflight_failure_stops_before_claude(self):
+        from patchpilot import runner
+        from patchpilot.errors import s_message
+
+        def broken(repo, timeout=30, python=None):
+            raise runner.RunnerError("S15", s_message("S15", detail="No module named pytest"))
+
+        with mock.patch.object(runner, "preflight_pytest", broken):
+            code, screen, rep, calls, out = self.run_cli([resp(GOOD_DIFF)])
+        self.assertEqual(code, 2, screen)
+        self.assertEqual(calls, [])
+        self.assertEqual(rep["result"]["error"]["code"], "S15")
+        self.assertIn('Fix: python -m pip install -e ".[dev]"', screen)
+        self.assertFalse((out / "patchpilot.patch").exists())
+
     def test_no_llm(self):
         code, screen, rep, calls, out = self.run_cli([], argv=("check", "--no-llm"))
         self.assertEqual(code, 1)
         self.assertEqual(calls, [])
         self.assertTrue((out / "spec_diff.json").exists())
+
+
+class PreflightTests(unittest.TestCase):
+    """runner.preflight_pytest with a stub `pytest` placed first on PYTHONPATH."""
+
+    def setUp(self):
+        self.repo = make_repo()
+
+    def tearDown(self):
+        shutil.rmtree(self.repo, ignore_errors=True)
+
+    def stub(self, init_src, main_src=None):
+        pkg = self.repo / "pytest"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(init_src, encoding="utf-8")
+        if main_src is not None:
+            (pkg / "__main__.py").write_text(main_src, encoding="utf-8")
+
+    def code_and_message(self, fn):
+        from patchpilot import runner
+        with self.assertRaises(runner.RunnerError) as cm:
+            fn()
+        return cm.exception.code, cm.exception.exit_code, cm.exception.message
+
+    def test_pytest_missing(self):
+        from patchpilot import runner
+        self.stub("raise ModuleNotFoundError(\"No module named 'pytest'\")\n")
+        code, exit_code, msg = self.code_and_message(lambda: runner.preflight_pytest(self.repo))
+        self.assertEqual((code, exit_code), ("S15", 2))
+        self.assertIn("No module named pytest", msg)
+        self.assertIn('pip install -e ".[dev]"', msg)
+
+    def test_collected_ok(self):
+        from patchpilot import runner
+        self.stub("", "print('tests/test_weather.py::test_a')\nprint()\nprint('4 tests collected in 0.01s')\n")
+        self.assertEqual(runner.preflight_pytest(self.repo), 4)
+
+    def test_zero_collected(self):
+        from patchpilot import runner
+        self.stub("", "import sys\nprint('no tests collected in 0.01s')\nsys.exit(5)\n")
+        code, exit_code, msg = self.code_and_message(lambda: runner.preflight_pytest(self.repo))
+        self.assertEqual((code, exit_code), ("S15", 2))
+        self.assertIn("0 tests collected", msg)
+
+    def test_collection_error(self):
+        from patchpilot import runner
+        self.stub("", "import sys\nprint('ERROR collecting tests/test_weather.py')\n"
+                      "print(\"E   ModuleNotFoundError: No module named 'requests'\")\n"
+                      "print('1 error in 0.05s')\nsys.exit(2)\n")
+        code, exit_code, msg = self.code_and_message(lambda: runner.preflight_pytest(self.repo))
+        self.assertEqual((code, exit_code), ("S15", 2))
+        self.assertIn("ModuleNotFoundError: No module named 'requests'", msg)
+
+    def test_no_cache_files_written(self):
+        from patchpilot import runner
+        self.stub("", "print('4 tests collected in 0.01s')\n")
+        before = runner.tests_hash(self.repo)
+        runner.preflight_pytest(self.repo)
+        self.assertEqual(runner.tests_hash(self.repo), before)
+
+
+# --- --pr (patchpilot/pr.py) ----------------------------------------------
+# Real git in a temp repo. origin points at the real allowed URL so the origin
+# guard is tested as it runs on the laptop, but `git push` is redirected to a
+# local bare repo (no network). `gh` is a stub script on PATH. Nothing here
+# touches GitHub.
+
+ALLOWED_URL = "https://github.com/aiwhyclub/patch-pilot-duet.git"
+FAKE_PR_URL = "https://github.com/aiwhyclub/patch-pilot-duet/pull/7"
+FAKE_GH = """#!/bin/sh
+echo "$@" >> "$GH_LOG"
+case "$1 $2" in
+  "auth status") exit ${GH_AUTH_EXIT:-0} ;;
+  "pr create") echo "Creating pull request..."; echo "%s"; exit 0 ;;
+esac
+exit 1
+""" % FAKE_PR_URL
+
+
+def git(repo, *args):
+    import subprocess
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+class OriginRuleTests(unittest.TestCase):
+    def test_accepts_only_the_exact_repo(self):
+        from patchpilot import pr
+        ok = ["https://github.com/aiwhyclub/patch-pilot-duet",
+              "https://github.com/aiwhyclub/patch-pilot-duet.git",
+              "https://github.com/aiwhyclub/patch-pilot-duet/",
+              "git@github.com:aiwhyclub/patch-pilot-duet.git",
+              "git@github.com:aiwhyclub/patch-pilot-duet",
+              "https://drone@github.com/aiwhyclub/patch-pilot-duet.git"]
+        bad = ["https://github.com/aiwhyclub/patch-pilot",          # the other project
+               "https://github.com/aiwhyclub/patch-pilot.git",
+               "git@github.com:aiwhyclub/patch-pilot.git",
+               "https://github.com/aiwhyclub/patch-pilot-duet-old.git",
+               "https://github.com/someone/patch-pilot-duet.git",
+               "https://gitlab.com/aiwhyclub/patch-pilot-duet.git",
+               "/tmp/patch-pilot-duet.git", ""]
+        for u in ok:
+            self.assertTrue(pr.origin_ok(u), u)
+        for u in bad:
+            self.assertFalse(pr.origin_ok(u), u)
+
+    def test_credentials_never_shown(self):
+        from patchpilot import pr
+        self.assertEqual(pr.safe_url("fatal: https://x:ghp_SECRET@github.com/a/b.git denied"),
+                         "fatal: https://github.com/a/b.git denied")
+
+
+class PrCliTests(CliHarness):
+    """`patchpilot check --pr` end to end against a temp git repo."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = Path(tempfile.mkdtemp(prefix="pp-pr-"))
+        self.bare = self.tmp / "origin.git"
+        git(self.tmp, "init", "-q", "--bare", str(self.bare))
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "user.name", "PatchPilot Test")
+        git(self.repo, "config", "user.email", "test@example.invalid")
+        git(self.repo, "add", "client", "tests")
+        git(self.repo, "commit", "-q", "-m", "v1 client")
+        git(self.repo, "remote", "add", "origin", ALLOWED_URL)
+        self.main_sha = git(self.repo, "rev-parse", "main")
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "gh").write_text(FAKE_GH, encoding="utf-8")
+        (bin_dir / "gh").chmod(0o755)
+        self.gh_log = self.tmp / "gh.log"
+        self.env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "HOME": str(self.tmp), "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_NOSYSTEM": "1", "GH_LOG": str(self.gh_log)}
+        from patchpilot import pr
+        real_run = pr._run
+        self.push_target = str(self.bare)
+
+        def redirected(cmd, repo, timeout=pr.GIT_TIMEOUT_S, check=True):
+            if cmd[:2] == ["git", "push"]:
+                cmd = [self.push_target if c == "origin" else c for c in cmd]
+            return real_run(cmd, repo, timeout=timeout, check=check)
+
+        self.run_patch = mock.patch.object(pr, "_run", redirected)
+        self.run_patch.start()
+
+    def tearDown(self):
+        self.run_patch.stop()
+        super().tearDown()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def pr_cli(self, responses=None, **env):
+        return self.run_cli([resp(GOOD_DIFF)] if responses is None else responses,
+                            env={**self.env, **env}, argv=("check", "--pr"))
+
+    def gh_calls(self):
+        return self.gh_log.read_text().splitlines() if self.gh_log.exists() else []
+
+    def assert_main_untouched(self):
+        self.assertEqual(git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+        self.assertEqual(git(self.repo, "rev-parse", "main"), self.main_sha)
+        self.assertEqual((self.repo / "client/weather_client.py").read_text(), CLIENT_V1)
+        self.assertEqual(git(self.repo, "status", "--porcelain", "--untracked-files=no"), "")
+
+    def branches(self, repo):
+        return [b.strip("* ").strip() for b in git(repo, "branch", "--list").splitlines()]
+
+    def test_happy_path(self):
+        (self.repo / "client" / "__pycache__").mkdir()
+        (self.repo / "client" / "__pycache__" / "x.pyc").write_bytes(b"junk")   # untracked: ignored
+        code, screen, rep, calls, out = self.pr_cli()
+        self.assertEqual(code, 0, screen)
+        self.assertIn(f"PR  {FAKE_PR_URL}", screen)
+        self.assertLess(screen.index("[5/5] Verify"), screen.index(f"PR  {FAKE_PR_URL}"))
+        self.assert_main_untouched()
+        branch = rep["result"]["pr"]["branch"]
+        self.assertRegex(branch, r"^patchpilot/openmeteo-v2-\d{8}-\d{6}$")
+        self.assertIn(branch, self.branches(self.bare))                      # pushed
+        files = git(self.repo, "show", "--name-only", "--format=", branch).splitlines()
+        self.assertEqual(files, ["client/weather_client.py"])                # client/ only
+        self.assertIn('data["current"]["temperature_2m"]',
+                      git(self.repo, "show", f"{branch}:client/weather_client.py"))
+        self.assertEqual(git(self.repo, "show", "main:client/weather_client.py") + "\n", CLIENT_V1)
+        self.assertEqual(rep["result"]["status"], "patched")
+        self.assertEqual(rep["result"]["pr_url"], FAKE_PR_URL)
+        self.assertEqual(rep["result"]["pr"]["status"], "created")
+        create = [c for c in self.gh_calls() if c.startswith("pr create")]
+        self.assertEqual(len(create), 1)
+        self.assertIn("--repo aiwhyclub/patch-pilot-duet", create[0])
+        self.assertIn("--base main", create[0])
+        self.assertIn(f"--head {branch}", create[0])
+        self.assertIn(f"--body-file {out / 'PR_BODY.md'}", create[0])
+        self.assertTrue((out / "patchpilot.patch").exists())
+
+    def test_wrong_origin_does_nothing(self):
+        git(self.repo, "remote", "set-url", "origin", "https://github.com/aiwhyclub/patch-pilot.git")
+        code, screen, rep, calls, out = self.pr_cli()
+        self.assertEqual(code, 2, screen)
+        self.assertEqual(rep["result"]["error"]["code"], "S16")
+        self.assertIn("origin is not aiwhyclub/patch-pilot-duet", screen)
+        self.assertEqual(calls, [])                                          # Claude never called
+        self.assertEqual(self.gh_calls(), [])
+        self.assertEqual(self.branches(self.repo), ["main"])
+        self.assert_main_untouched()
+
+    def test_push_url_must_match_too(self):
+        git(self.repo, "remote", "set-url", "--push", "origin", "git@github.com:aiwhyclub/patch-pilot.git")
+        code, screen, rep, calls, out = self.pr_cli()
+        self.assertEqual((code, rep["result"]["error"]["code"]), (2, "S16"), screen)
+        self.assertEqual(calls, [])
+
+    def test_dirty_tree_stops_before_start(self):
+        (self.repo / "client/weather_client.py").write_text(CLIENT_V1 + "# local edit\n")
+        code, screen, rep, calls, out = self.pr_cli()
+        self.assertEqual(code, 2, screen)
+        self.assertEqual(rep["result"]["error"]["code"], "S17")
+        self.assertIn("client/weather_client.py", screen)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.branches(self.repo), ["main"])
+        self.assertEqual((self.repo / "client/weather_client.py").read_text(), CLIENT_V1 + "# local edit\n")
+
+    def test_gh_not_logged_in_skips_pr_only(self):
+        code, screen, rep, calls, out = self.pr_cli(GH_AUTH_EXIT="1")
+        self.assertEqual(code, 0, screen)
+        self.assertIn("PR skipped: gh not authenticated", screen)
+        self.assert_main_untouched()
+        branch = rep["result"]["pr"]["branch"]
+        self.assertIn(branch, self.branches(self.bare))                      # branch still pushed
+        self.assertEqual(rep["result"]["pr"]["status"], "skipped_gh")
+        self.assertIsNone(rep["result"]["pr_url"])
+        self.assertFalse([c for c in self.gh_calls() if c.startswith("pr create")])
+
+    def test_gh_missing_skips_pr_only(self):
+        from patchpilot import pr
+        real_which = shutil.which
+        with mock.patch.object(pr.shutil, "which", lambda n: None if n == "gh" else real_which(n)):
+            code, screen, rep, calls, out = self.pr_cli()
+        self.assertEqual(code, 0, screen)
+        self.assertIn("PR skipped: gh not authenticated", screen)
+        self.assertEqual(self.gh_calls(), [])
+        self.assert_main_untouched()
+
+    def test_push_failure_keeps_patch_and_returns(self):
+        self.push_target = str(self.tmp / "no-such-remote.git")
+        code, screen, rep, calls, out = self.pr_cli()
+        self.assertEqual(code, 2, screen)
+        self.assertIn("--pr: git push failed", screen)
+        self.assertIn("Local branch kept: git push -u origin patchpilot/openmeteo-v2-", screen)
+        self.assertEqual(rep["result"]["status"], "patched")
+        self.assertEqual(rep["result"]["exit_code"], 2)
+        self.assertEqual(rep["result"]["error"]["code"], "S19")
+        self.assertTrue((out / "patchpilot.patch").exists())
+        self.assert_main_untouched()
+        self.assertIn(rep["result"]["pr"]["branch"], self.branches(self.repo))
+        self.assertFalse([c for c in self.gh_calls() if c.startswith("pr create")])
+
+    def test_no_verified_patch_makes_no_branch(self):
+        code, screen, rep, calls, out = self.pr_cli([resp("prose"), resp("prose"), resp("prose")])
+        self.assertEqual(code, 1, screen)
+        self.assertIn("--pr: no verified patch", screen)
+        self.assertEqual(self.branches(self.repo), ["main"])
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_create_refuses_patch_outside_client(self):
+        from patchpilot import pr
+        bad = self.tmp / "bad.patch"
+        bad.write_text(TEST_DIFF, encoding="utf-8")
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            res = pr.create(self.repo, patch_file=bad, body_file=bad, client_dir="client",
+                            title="t")
+        self.assertEqual(res.status, "failed")
+        self.assertEqual(res.error.code, "S19")
+        self.assertIn("outside client/", res.error.message)
+        self.assertEqual(self.branches(self.repo), ["main"])                # empty branch removed
+        self.assertEqual((self.repo / "tests/test_weather.py").read_text(), "x = 1\n")
+        self.assert_main_untouched()
+
+    def test_create_bad_patch_cleans_up(self):
+        from patchpilot import pr
+        bad = self.tmp / "bad.patch"
+        bad.write_text(BAD_CONTEXT_DIFF, encoding="utf-8")
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            res = pr.create(self.repo, patch_file=bad, body_file=bad, client_dir="client",
+                            title="t")
+        self.assertEqual((res.status, res.error.code), ("failed", "S19"))
+        self.assertIn("git apply failed", res.error.message)
+        self.assertEqual(self.branches(self.repo), ["main"])
+        self.assert_main_untouched()
 
 
 if __name__ == "__main__":

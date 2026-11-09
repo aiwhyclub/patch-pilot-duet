@@ -5,6 +5,7 @@ backend-ai.md section 3 (standard pytest command, hash rules).
 
     tests_hash(root)        -> "sha256:<hex>"   (raises RunnerError S05)
     check_proxy(base_url)   -> "v1" | "v2"      (raises RunnerError S06)
+    preflight_pytest(repo)  -> int collected    (raises RunnerError S15 / S11)
     run_pytest(repo)        -> TestRun          (raises RunnerError S11 on timeout)
     fresh_copy(repo)        -> Path to a new temporary copy of the repo
 """
@@ -151,6 +152,57 @@ def _parse_pytest(output: str) -> tuple[int, int, list[str], dict[str, str]]:
                 failed_tests.append(name)
                 first_error[name] = (m.group(3) or "").strip()
     return passed, failed, failed_tests, first_error
+
+
+_COLLECTED_RE = re.compile(r"(\d+) tests? collected")
+_SETUP_ERROR_RE = re.compile(r"(ModuleNotFoundError|ImportError)[^\n]*")
+COLLECT_ARGS = ["-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "tests/"]
+
+
+def _pytest_env(repo: Path) -> dict:
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.setdefault("COLUMNS", "200")  # [integration] keep pytest's one-line errors uncut
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(repo)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    )
+    return env
+
+
+def preflight_pytest(repo: Path, timeout: int = 30, python: str | None = None) -> int:
+    """Check the test setup before step 3. Returns the number of collected tests.
+
+    Raises RunnerError S15 (exit 2) when pytest cannot be imported, collection
+    reports errors, or 0 tests are collected. Writes no cache files, so the
+    tests hash is unchanged. Raises S11 on timeout.
+    """
+    repo = Path(repo)
+    py = python or sys.executable
+    env = _pytest_env(repo)
+    try:
+        imp = subprocess.run([py, "-c", "import pytest"], cwd=repo, env=env,
+                             capture_output=True, text=True, timeout=timeout)
+        if imp.returncode != 0:
+            raise RunnerError("S15", s_message("S15", detail="No module named pytest"),
+                              output=imp.stderr)
+        proc = subprocess.run([py, *COLLECT_ARGS], cwd=repo, env=env,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RunnerError("S11", s_message("S11", n=timeout)) from None
+    output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
+    m = _COLLECTED_RE.search(output)
+    collected = int(m.group(1)) if m else 0
+    if proc.returncode == 0 and collected > 0:
+        return collected
+    err = _SETUP_ERROR_RE.search(output)
+    if err:
+        detail = err.group(0).strip()
+    elif proc.returncode in (0, 5) or collected == 0:
+        detail = "0 tests collected"
+    else:
+        last = (output.strip().splitlines() or ["collection failed"])[-1]
+        detail = f"collection failed: {last.strip()}"
+    raise RunnerError("S15", s_message("S15", detail=detail[:160]), output=output)
 
 
 def run_pytest(repo: Path, timeout: int = 60, python: str | None = None) -> TestRun:

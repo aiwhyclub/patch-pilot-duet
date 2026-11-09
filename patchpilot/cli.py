@@ -7,6 +7,9 @@ tests_hash] -> report.write.
 
 Exit codes: 0 patched / nothing to patch, 1 no verified patch (incl.
 E_REFUSAL), 2 config error, 3 Claude API unavailable.
+--pr (patchpilot/pr.py): S16/S17/S18 -> 2 before any Claude call; after a
+verified patch, a failed git/gh step -> S19, exit 2 (patch file kept);
+gh missing or not logged in -> branch still pushed, PR skipped, exit 0.
 Screen text follows frd-trd.md 14 / backend-ai.md 4; styling is hkt-design's.
 """
 from __future__ import annotations
@@ -18,7 +21,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from patchpilot import errors, guard, report
+from patchpilot import errors, guard, pr, report
 from patchpilot.errors import (
     E_REFUSAL, E_TEST_HASH_CHANGED, E_TESTS_FAILED, PatchPilotError, screen_reason,
 )
@@ -32,7 +35,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8787"
 class _Screen:
     def __init__(self, quiet: bool):
         self.quiet = quiet
-        self.rich = None    # [integration] render.Screen when the terminal view is on
+        self.rich = None    # [integration] render.Screen while the terminal view is live
 
     def __call__(self, text: str = "") -> None:
         if not self.quiet and self.rich is None:
@@ -69,7 +72,8 @@ def _parser() -> argparse.ArgumentParser:
     c.add_argument("--max-attempts", type=int, default=3, choices=[1, 2, 3])
     c.add_argument("--no-llm", action="store_true", help="run steps 1-3 only")
     c.add_argument("--json", action="store_true", help="print report.json instead of the screen")
-    c.add_argument("--yes-pr", action="store_true", help="stretch: not implemented in this build")
+    c.add_argument("--pr", "--yes-pr", dest="pr", action="store_true",
+                   help="after a verified patch: new branch, commit client/ only, push, gh pr create")
     c.add_argument("--base-url", default=None, help="override WEATHER_BASE_URL")
     c.add_argument("--plain", action="store_true", help="plain text output (no live terminal view)")
     return p
@@ -111,12 +115,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     state: dict = {"diff": None, "usages": [], "reproduce": None, "hash_before": None,
                    "attempts": [], "verify": None, "hash_after": None, "stage": None,
-                   "model": None}
+                   "model": None, "report": None}
     base_url = args.base_url or os.environ.get("WEATHER_BASE_URL") or DEFAULT_BASE_URL
     os.environ["WEATHER_BASE_URL"] = base_url   # [integration] frd-trd §19.1: tests read the same value
 
     def finish(status: str, patch_text: Optional[str] = None,
-               err: Optional[PatchPilotError] = None) -> int:
+               err: Optional[PatchPilotError] = None, emit: bool = True) -> int:
         rep = report.build(
             status=status, out_dir=out_rel, base_url=base_url, proxy_stage=state["stage"],
             diff=state["diff"], usages=state["usages"], reproduce=state["reproduce"],
@@ -125,12 +129,36 @@ def main(argv: Optional[list[str]] = None) -> int:
             error_code=err.code if err else None, error_message=err.message if err else None,
         )
         report.write(rep, patch_text, out_dir, diff=state["diff"])
+        state["report"] = rep
+        if args.json and emit:
+            print(json.dumps(rep, indent=2, ensure_ascii=False))
+        return rep["result"]["exit_code"]
+
+    def open_pr() -> int:
+        """--pr after a verified patch. report.json is rewritten with the outcome."""
+        rep = state["report"]
+        res = pr.create(repo, patch_file=out_dir / report.PATCH_FILE,
+                        body_file=out_dir / report.PR_BODY_FILE, client_dir=args.client,
+                        title=report.PR_TITLE, out_rel=out_rel)
+        if res.status == "created":
+            say(f"PR  {res.url}")
+            report.set_pr(rep, res.to_dict(), out_dir)
+        elif res.status == "skipped_gh":
+            say("PR skipped: gh not authenticated")
+            say(f"      branch {res.branch} was pushed; back on {res.base}")
+            report.set_pr(rep, res.to_dict(), out_dir)
+        else:
+            say(f"FAIL  {res.error.message}")
+            report.set_pr(rep, res.to_dict(), out_dir, exit_code=res.error.exit_code,
+                          error_code=res.error.code, error_message=res.error.message)
         if args.json:
             print(json.dumps(rep, indent=2, ensure_ascii=False))
         return rep["result"]["exit_code"]
 
     try:
         report.prepare_out(out_dir)
+        if args.pr:
+            pr.preflight(repo, out_rel)                              # S18/S16/S17: nothing changed
         if not args.no_llm:
             state["model"] = llm_client.resolve_model()             # S13 before anything else
         state["stage"] = runner.check_proxy(base_url)                # S06
@@ -141,8 +169,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             say("WARN  " + errors.warn_message("W03"))
         ui = _rich_screen(args)
         if ui is not None:
-            if state["stage"] == "v1":
-                print("WARN  " + errors.warn_message("W03"), flush=True)
             say.rich = ui
             ui.header()
             ui.step_start(1)
@@ -170,6 +196,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             say("DONE  " + errors.s_message("S09"))
             if ui is not None:
                 ui.render_summary((errors.s_message("S09"),))
+                say.rich = None
             return finish("nothing_to_patch")
 
         # [2/5] Affected usages
@@ -194,11 +221,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         if ui is not None:
             ui.step_start(3, note="pytest running…")
         state["hash_before"] = runner.tests_hash(repo)
+        runner.preflight_pytest(repo)                                # S15 before any Claude call
         repro = runner.run_pytest(repo)
         if ui is not None:
             ui.render_test_run(repro, state["hash_before"])
-            ui.step_end(3, True,
-                        f"pytest {repro.failed} failed, {repro.passed} passed | tests hash {_short(state['hash_before'])}")
+            ui.step_end(3, True, f"pytest {repro.failed} failed, {repro.passed} passed | "
+                                 f"tests hash {_short(state['hash_before'])}")
         state["reproduce"] = repro
         say("")
         say(f"[3/5] Reproduce   WEATHER_BASE_URL={base_url}")
@@ -209,12 +237,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             say("DONE  " + errors.s_message("S10") + f" (proxy stage: {state['stage']})")
             if ui is not None:
                 ui.render_summary((errors.s_message("S10") + f" (proxy stage: {state['stage']})",))
+                say.rich = None
             return finish("nothing_to_patch")
         if args.no_llm:
-            say("STOP  --no-llm: patch step skipped. No patch file was written.")
             if ui is not None:
                 ui.close()
-                print("STOP  --no-llm: patch step skipped. No patch file was written.", flush=True)
+                say.rich = None
+            say("STOP  --no-llm: patch step skipped. No patch file was written.")
             return finish("no_verified_patch")
 
         # [4/5] Patch + [5/5] Verify
@@ -313,18 +342,30 @@ def main(argv: Optional[list[str]] = None) -> int:
             say(f"DONE  {out_rel}/{report.PATCH_FILE}, {out_rel}/{report.PR_BODY_FILE}")
             if ui is not None:
                 a = state["attempts"][-1]
+                nf = len(a.files)
                 hb, ha = _short(state["hash_before"]), _short(state["hash_after"])
                 ui.step_end(4, True, f"attempt {a.n}/{max_attempts}  ... diff OK "
-                            f"({len(a.files)} file{'s' if len(a.files) != 1 else ''}, +{a.added} -{a.removed})")
+                            f"({nf} file{'s' if nf != 1 else ''}, +{a.added} -{a.removed})")
                 ui.step_start(5)
                 v = state["verify"]
                 ui.step_end(5, True, f"apply OK | pytest {v.passed} passed | tests hash {hb} = {ha}")
                 ui.render_hash_check(repro, v, state["hash_before"], state["hash_after"],
-                                     files_changed=f"client/ only ({len(a.files)} file{'s' if len(a.files) != 1 else ''})")
+                                     files_changed=f"client/ only ({nf} file{'s' if nf != 1 else ''})")
                 ui.render_summary((f"{out_rel}/{report.PATCH_FILE}", f"{out_rel}/{report.PR_BODY_FILE}"))
-            if args.yes_pr:
-                say("NOTE  --yes-pr is not implemented in this build; PR not created (patch saved)")
-            return finish("patched", patch_text)
+                say.rich = None        # PR lines (--pr) print below the frozen screen
+            if not args.pr:
+                return finish("patched", patch_text)
+            finish("patched", patch_text, emit=False)
+            try:
+                return open_pr()
+            except PatchPilotError as exc:          # S16/S17 re-check, or S19 from the return step
+                say(f"FAIL  {exc.message}")
+                report.set_pr(state["report"], {"status": "failed", "url": None,
+                              "error": {"code": exc.code, "message": exc.message}}, out_dir,
+                              exit_code=exc.exit_code, error_code=exc.code, error_message=exc.message)
+                if args.json:
+                    print(json.dumps(state["report"], indent=2, ensure_ascii=False))
+                return exc.exit_code
 
         n_done = len(state["attempts"])
         if ui is not None:
@@ -333,18 +374,24 @@ def main(argv: Optional[list[str]] = None) -> int:
                             attempts=[(a.n, a.code or "", (a.detail or "").splitlines()[0] if a.detail else "")
                                       for a in state["attempts"]],
                             tests_hash=(state["hash_before"], runner.tests_hash(repo)), max_n=n_done)
+            if args.pr:
+                print("      --pr: no verified patch, so no branch or PR was created.", flush=True)
         say(f"FAIL  No verified patch after {n_done} attempt{'s' if n_done != 1 else ''}.")
         for a in state["attempts"]:
             say(f"      attempt {a.n}: {a.code:<17} ({(a.detail or '').splitlines()[0] if a.detail else ''})")
         say(f"      Tests unchanged: hash {_short(state['hash_before'])} = "
             f"{_short(runner.tests_hash(repo))}")
         say(f"      No patch file was written. Raw outputs: {out_rel}/{report.ATTEMPTS_DIR}/attempt_N.txt")
+        if args.pr:
+            say("      --pr: no verified patch, so no branch or PR was created.")
         return finish("no_verified_patch")
 
     except PatchPilotError as exc:
-        say(f"FAIL  {exc.message}")
-        if ui is not None:
+        if ui is not None and say.rich is not None:
             ui.render_error(exc.message)
+            say.rich = None
+        else:
+            say(f"FAIL  {exc.message}")
         if exc.exit_code == errors.EXIT_OK:
             return finish("nothing_to_patch")
         status = report.EXIT_STATUS_ON_ERROR.get(exc.exit_code, "config_error")

@@ -31,6 +31,16 @@ S_CODES: dict[str, tuple[str, int]] = {
     "S13": ("PATCHPILOT_MODEL must be one of the two supported model IDs (got {value})", EXIT_CONFIG),
     # [proposed] not in frd-trd.md 15: the SDK package is missing in this Python.
     "S14": ("anthropic SDK is not installed: python -m pip install \"anthropic==2.6.0\"", EXIT_CONFIG),
+    # [proposed] not in frd-trd.md 15: pytest missing or tests not collectable.
+    # Checked before step 3 so Claude is never called on a broken test setup.
+    "S15": ("test setup error ({detail}). Fix: python -m pip install -e \".[dev]\"", EXIT_CONFIG),
+    # [proposed] --pr (patchpilot/pr.py). S16-S18 are checked before any Claude
+    # call and again before any git change; nothing is changed when they fire.
+    "S16": ("--pr: origin is not aiwhyclub/patch-pilot-duet (got {url}). Nothing was changed.", EXIT_CONFIG),
+    "S17": ("--pr: working tree has uncommitted changes ({files}). Commit or stash them first.", EXIT_CONFIG),
+    "S18": ("--pr: not usable as a git repository ({detail})", EXIT_CONFIG),
+    # After a verified patch: the patch file stays, and we are back on the original branch.
+    "S19": ("--pr: {step} failed: {detail}. Patch kept in {patch}; back on {branch}.", EXIT_CONFIG),
 }
 
 W_CODES: dict[str, str] = {

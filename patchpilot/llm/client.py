@@ -28,8 +28,10 @@ MODEL_ENV = "PATCHPILOT_MODEL"
 KEY_ENV = "ANTHROPIC_API_KEY"
 
 MAX_TOKENS = 16000
-TIMEOUT_S = 90.0
+TIMEOUT_S = 90.0            # backend-ai.md 5.2 default
+TIMEOUT_ENV = "PATCHPILOT_TIMEOUT_S"   # optional override, 30..600 seconds
 MAX_RETRIES = 2
+RETRYABLE_4XX = (408, 409)
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 # Metadata of the most recent call, for out/runs.jsonl and the E_REFUSAL
@@ -51,6 +53,19 @@ def effort_for_attempt(n: int) -> str:
     return "high" if n >= 3 else "medium"
 
 
+def timeout_s(env: Optional[dict] = None) -> float:
+    """Per-request timeout. PATCHPILOT_TIMEOUT_S overrides 90 s (clamped to 30..600).
+    The SDK retries a timeout, so worst-case wait is timeout x (MAX_RETRIES + 1)."""
+    env = os.environ if env is None else env
+    raw = env.get(TIMEOUT_ENV)
+    if not raw:
+        return TIMEOUT_S
+    try:
+        return min(600.0, max(30.0, float(raw)))
+    except ValueError:
+        return TIMEOUT_S
+
+
 def _import_sdk():
     try:
         import anthropic  # noqa: WPS433 (lazy: other modules work without the SDK)
@@ -65,7 +80,7 @@ def make_client():
         raise fail("S07")
     anthropic = _import_sdk()
     try:
-        return anthropic.Anthropic(timeout=TIMEOUT_S, max_retries=MAX_RETRIES)
+        return anthropic.Anthropic(timeout=timeout_s(), max_retries=MAX_RETRIES)
     except anthropic.AnthropicError:
         raise fail("S07") from None
 
@@ -97,7 +112,9 @@ def _map_sdk_error(anthropic, exc: BaseException) -> PatchPilotError:
         return fail("S12", error_type=_error_type(exc))
     if isinstance(exc, anthropic.APIStatusError):
         status = getattr(exc, "status_code", 0) or 0
-        if status >= 500:
+        # 408 / 409 / 5xx (incl. 529 overloaded) are the codes the SDK itself
+        # retries; still failing after retries means "temporarily unavailable".
+        if status >= 500 or status in RETRYABLE_4XX:
             return fail("S12", error_type=_error_type(exc))
         return fail("S08", error_type=_error_type(exc), first_line=_first_line(exc))
     if isinstance(exc, anthropic.APIConnectionError):   # APITimeoutError is a subclass
@@ -145,7 +162,9 @@ def request_patch(system: str, user: str, effort: str, *,
                           "error_type": _error_type(exc)})
         raise _map_sdk_error(anthropic, exc) from None
 
-    raw = "".join(getattr(b, "text", "") for b in (resp.content or [])
+    # Only `text` blocks carry the answer; `thinking` blocks (empty text by
+    # default on these models) and any other block type are skipped.
+    raw = "".join((getattr(b, "text", None) or "") for b in (getattr(resp, "content", None) or [])
                   if getattr(b, "type", None) == "text")
     stop_reason = getattr(resp, "stop_reason", None) or ""
     usage = getattr(resp, "usage", None)

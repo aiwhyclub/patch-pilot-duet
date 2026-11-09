@@ -8,6 +8,8 @@ The pipeline calls only the functions in this module. Inputs are plain values,
 dicts, or objects with matching attributes (models.py), so this module has no
 dependency on the rest of the package.
 
+ASCII mode (PATCHPILOT_ASCII=1): same screen, symbols replaced 1:1 (see ASCII_TABLE).
+
 Plain mode (NO_COLOR set, stdout not a TTY, or PATCHPILOT_PLAIN=1): no colors,
 no symbols, no live redraw. Each finished step prints its log line verbatim.
 """
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+import re
 import time
 from typing import Any, Iterable
 
@@ -35,6 +38,34 @@ PATCH_PREVIEW_MAX = 12  # design §3.4
 USAGES_MAX = 8          # design §3.2
 HASH_LEN = 12           # design §1
 STEP_NAMES = {1: "Diff", 2: "Usages", 3: "Reproduce", 4: "Patch", 5: "Verify"}
+
+# ASCII fallback (PATCHPILOT_ASCII=1) for terminals or fonts that do not show the symbols.
+# One-to-one, same width, so layout and the 24-line budget do not change.
+ASCII_TABLE = str.maketrans({
+    "✓": "+", "✗": "x", "⊘": "!", "○": "-", "●": "*", "→": ">", "…": ".", "—": "-",
+    "╭": "+", "╮": "+", "╰": "+", "╯": "+", "┌": "+", "┐": "+", "└": "+", "┘": "+",
+    "├": "+", "┤": "+", "┬": "+", "┴": "+", "┼": "+", "│": "|", "─": "-", "·": "-",
+})
+
+
+def _ascii_mode() -> bool:
+    return os.environ.get("PATCHPILOT_ASCII") == "1"
+
+
+class _Ascii:
+    """Renders the wrapped renderable with ASCII_TABLE applied to every segment."""
+
+    def __init__(self, renderable: Any) -> None:
+        self.renderable = renderable
+
+    def __rich_console__(self, console: Console, options: Any):
+        from rich.segment import Segment
+        for seg in console.render(self.renderable, options):
+            if seg.control or not seg.text:
+                yield seg
+            else:
+                yield Segment(seg.text.translate(ASCII_TABLE), seg.style)
+
 
 S_HASH = "bold magenta"
 S_PASS = "bold green"
@@ -81,7 +112,8 @@ class Screen:
     def __init__(self, console: Console | None = None, plain: bool | None = None,
                  freeze_seconds: float | None = None) -> None:
         self.plain = _plain_mode() if plain is None else plain
-        self.console = console or Console(
+        self.ascii = _ascii_mode()
+        self._console = console or Console(
             width=min(100, Console().width) if not self.plain else 200,
             no_color=self.plain, highlight=False, emoji=False,
             force_terminal=None if not self.plain else False,
@@ -98,6 +130,14 @@ class Screen:
         self.footer: list[Any] = []
         self.live: Live | None = None
 
+    @property
+    def console(self) -> Console:
+        return self._console
+
+    def _say(self, text: str) -> None:
+        """Plain-mode line (verbatim log text)."""
+        self._console.print(text.translate(ASCII_TABLE) if self.ascii else text, markup=False)
+
     # ---------- live frame ----------
     def _elapsed(self) -> str:
         if self.frozen_elapsed:
@@ -105,7 +145,7 @@ class Screen:
         s = int(time.monotonic() - self.started)
         return f"{s // 60:02d}:{s % 60:02d}"
 
-    def __rich__(self) -> Constrain:
+    def __rich__(self) -> Any:
         head = Table.grid(expand=True)
         head.add_column(ratio=1)
         head.add_column(justify="right")
@@ -119,7 +159,7 @@ class Screen:
                 row = Table.grid(padding=(0, 1))
                 row.add_column(width=2, justify="right")
                 row.add_column()
-                row.add_row(Spinner("dots", style="bold"),
+                row.add_row(Spinner("line" if self.ascii else "dots", style="bold"),
                             Text(label, style="bold") + _as_text(result))
                 parts.append(row)
                 continue
@@ -134,7 +174,8 @@ class Screen:
             parts.append(Rule(style="dim"))
             parts.extend(self.detail[:DETAIL_MAX_LINES])
         parts.extend(self.footer)
-        return Constrain(Group(*parts), width=MAX_WIDTH)
+        frame = Constrain(Group(*parts), width=MAX_WIDTH)
+        return _Ascii(frame) if self.ascii else frame
 
     def _refresh(self) -> None:
         if self.live:
@@ -146,7 +187,7 @@ class Screen:
         self.title = f"{project} {api}"
         self.started = time.monotonic()
         if self.plain:
-            self.console.print(f"PatchPilot check - {project} {api}. v2 is a staged spec for this demo.")
+            self._say(f"PatchPilot check - {project} {api}. v2 is a staged spec for this demo.")
             return
         self.console.show_cursor(False)
         self.live = Live(self, console=self.console, auto_refresh=True,
@@ -164,9 +205,11 @@ class Screen:
     def step_end(self, n: int, ok: bool, line: str, seconds: float | None = None,
                  styled: Text | None = None) -> None:
         """Collapse step n into one line. `line` is the backend log text, verbatim."""
+        if not self.plain:
+            line, styled = _fit_step_line(line, styled, self.console.width - STEP_PREFIX)
         self.steps[n] = ("ok" if ok else "fail", styled if styled is not None else line)
         if self.plain:
-            self.console.print(_cut(f"[{n}/5] {STEP_NAMES[n]:<10}{line}"))
+            self._say(_cut(f"[{n}/5] {STEP_NAMES[n]:<10}{line}"))
         self._refresh()
 
     # ---------- 4. render_diff ----------
@@ -178,7 +221,7 @@ class Screen:
         rest = [c for c in changes if _get(c, "id") not in shown_ids]
         if self.plain:
             for c in changes:
-                self.console.print(f"  {_get(c,'id')}  {_get(c,'type')}  {_get(c,'from_')} -> {_get(c,'to')}")
+                self._say(f"  {_get(c,'id')}  {_get(c,'type')}  {_get(c,'from_')} -> {_get(c,'to')}")
             return
         top = Table.grid(expand=True)
         top.add_column(ratio=1)
@@ -204,7 +247,7 @@ class Screen:
         usages = list(usages)
         if self.plain:
             for u in usages:
-                self.console.print(f"  {_get(u,'path')}:{_get(u,'line')}: {_get(u,'code')}")
+                self._say(f"  {_get(u,'path')}:{_get(u,'line')}: {_get(u,'code')}")
             return
         lines: list[Any] = [_two_col(Text(" Affected usages", style="bold"), Text("path:line: code", style="dim"))]
         show = usages if len(usages) <= USAGES_MAX else usages[: USAGES_MAX - 1]
@@ -230,7 +273,7 @@ class Screen:
         """Reproduce: hash first, FAILED lines with one-line cause (design §3.3)."""
         passed, failed = _get(run, "passed", 0), _get(run, "failed", 0)
         if self.plain:
-            self.console.print(f"  pytest {failed} failed, {passed} passed | tests hash {short_hash(tests_hash)}")
+            self._say(f"  pytest {failed} failed, {passed} passed | tests hash {short_hash(tests_hash)}")
             return
         lines: list[Any] = [
             _two_col(Text(" Fixed tests against v2", style="bold"), Text("pytest -q tests/", style="dim")),
@@ -257,7 +300,7 @@ class Screen:
     def render_attempt(self, n: int, max_n: int, ok: bool | None, text: str) -> None:
         """One attempt line. ok=None: thinking, True: diff OK, False: use render_rejected."""
         if self.plain and ok is not None:
-            self.console.print(f"  attempt {n}/{max_n}  ... {text}")
+            self._say(f"  attempt {n}/{max_n}  ... {text}")
         line = Text(" ")
         line.append(*("●", "bold") if ok is None or ok else ("⊘", S_REJECT))
         line.append(f" attempt {n}/{max_n}  ... ")
@@ -283,7 +326,7 @@ class Screen:
     def render_rejected(self, n: int, max_n: int, code: str, reason: str) -> None:
         """Yellow ⊘ line: rejected (E_*): reason."""
         if self.plain:
-            self.console.print(_cut(f"  attempt {n}/{max_n}  ... rejected ({code}): {reason}"))
+            self._say(_cut(f"  attempt {n}/{max_n}  ... rejected ({code}): {reason}"))
         line = Text(" ")
         line.append("⊘", style=S_REJECT)
         line.append(f" attempt {n}/{max_n}  ... rejected (")
@@ -299,7 +342,7 @@ class Screen:
         hb, ha = short_hash(hash_before), short_hash(hash_after)
         same = hb == ha and hash_before == hash_after
         if self.plain:
-            self.console.print(f"  tests hash {hb} = {ha}" if same else f"  tests hash {hb} != {ha}")
+            self._say(f"  tests hash {hb} = {ha}" if same else f"  tests hash {hb} != {ha}")
             return
         g = Table.grid(padding=(0, 2))
         g.add_column(width=16, style="dim")
@@ -328,15 +371,16 @@ class Screen:
         """DONE line, then freeze >= 3 s: clock fixed, no spinner, cursor hidden."""
         done = "DONE  " + ", ".join(paths)
         if self.plain:
-            self.console.print(done)
+            self._say(done)
             return
         self.footer.append(Text.assemble((" DONE", "bold green"), "  " + ", ".join(paths)))
         self.frozen_elapsed = self._elapsed()
-        self._refresh()
         if self.live:
-            self.live.auto_refresh = False
-            self.live.stop()
+            # Live.stop() draws the final frame exactly once (in place). No extra refresh here.
+            self.live.update(self, refresh=False)
+            self.live.stop()  # note: rich shows the cursor here
             self.live = None
+        self.console.show_cursor(False)  # keep the freeze frame clean
         time.sleep(self.freeze_seconds)
         self.console.show_cursor(True)
 
@@ -347,7 +391,7 @@ class Screen:
         Never pass secret values here."""
         if attempts is None:
             if self.plain:
-                self.console.print(f"FAIL  {message}")
+                self._say(f"FAIL  {message}")
             else:
                 self.footer = [Text.assemble(("✗ FAIL", S_FAIL), "  " + _cut(message, 88), style="red")]
             self.close()
@@ -361,7 +405,7 @@ class Screen:
         lines.append(Text("      Raw outputs: out/attempts/attempt_{1,2,3}.txt", style="dim"))
         if self.plain:
             for l in lines:
-                self.console.print(l.plain)
+                self._say(l.plain)
             return
         chip = Text(" FAIL ", style="white on red")
         self.detail = []
@@ -372,11 +416,13 @@ class Screen:
         self.close()
 
     def close(self) -> None:
+        """Safe to call more than once; draws nothing after the screen is stopped."""
+        if self.live is None:
+            return
         self.frozen_elapsed = self._elapsed()
-        self._refresh()
-        if self.live:
-            self.live.stop()
-            self.live = None
+        self.live.update(self, refresh=False)
+        self.live.stop()
+        self.live = None
         self.console.show_cursor(True)
 
     # ---------- helpers ----------
@@ -397,6 +443,34 @@ def _as_text(value: Any) -> Text:
     if isinstance(value, Text):
         return value
     return Text(_cut(str(value), MAX_WIDTH - 18))
+
+
+STEP_PREFIX = 19   # " ✓ [5/5] Verify     " = 19 cells
+_HASH_EQ = re.compile(r"tests hash ([0-9a-f]+) = ([0-9a-f]+)")
+
+
+def _fit_step_line(line: str, styled: Text | None, room: int) -> tuple[str, Text | None]:
+    """Keep a collapsed step line on one row of a narrow terminal (e.g. 80 cols).
+    At 100 cols nothing changes. If too long, 'tests hash X = X' becomes
+    'tests unchanged (first 8)'; anything still too long is cut with '…'."""
+    if len(line) <= room:
+        return line, styled
+    m = _HASH_EQ.search(line)
+    if m and m.group(1) == m.group(2):
+        short = m.group(1)[:8]
+        head = line[: m.start()]
+        line = f"{head}tests unchanged ({short})" + line[m.end():]
+        styled = Text(head)
+        styled.highlight_regex(r"\d+ failed", "red")
+        styled.highlight_regex(r"\d+ passed", "green")
+        styled.append("tests unchanged (")
+        styled.append(short, style=S_HASH)
+        styled.append(")" + line[len(head) + len("tests unchanged (") + len(short) + 1:])
+    if len(line) > room:
+        line = _cut(line, room)
+        if styled is not None:
+            styled.truncate(room, overflow="ellipsis")
+    return line, styled
 
 
 def _two_col(left: Text, right: Text) -> Table:
